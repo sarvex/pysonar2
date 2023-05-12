@@ -13,20 +13,16 @@ is_python3 = hasattr(sys.version_info, 'major') and (sys.version_info.major == 3
 
 class AstEncoder(JSONEncoder):
     def default(self, o):
-        if hasattr(o, '__dict__'):
-            d = o.__dict__
-            # workaround: decode strings if it's not Python3 code
-            if not is_python3:
-                for k in d:
-                    if isinstance(d[k], str):
-                        if k == 's':
-                          d[k] = lines[d['start']:d['end']]
-                        else:
-                          d[k] = d[k].decode(enc)
-            d['type'] = o.__class__.__name__
-            return d
-        else:
+        if not hasattr(o, '__dict__'):
             return str(o)
+        d = o.__dict__
+            # workaround: decode strings if it's not Python3 code
+        if not is_python3:
+            for k in d:
+                if isinstance(d[k], str):
+                    d[k] = lines[d['start']:d['end']] if k == 's' else d[k].decode(enc)
+        d['type'] = o.__class__.__name__
+        return d
 
 
 enc = 'latin1'
@@ -34,16 +30,11 @@ lines = ''
 
 def parse_dump(filename, output, end_mark):
     try:
-        if is_python3:
-            encoder = AstEncoder()
-        else:
-            encoder = AstEncoder(encoding=enc)
-
+        encoder = AstEncoder() if is_python3 else AstEncoder(encoding=enc)
         tree = parse_file(filename)
         encoded = encoder.encode(tree)
-        f = open(output, "w")
-        f.write(encoded)
-        f.close()
+        with open(output, "w") as f:
+            f.write(encoded)
     finally:
         # write marker file to signal write end
         f = open(end_mark, "w")
@@ -113,12 +104,8 @@ def improve_ast(node, s):
 # build global table 'idxmap' for lineno <-> index oonversion
 def build_index_map(s):
     global line_starts
-    idx = 0
     line_starts = [0]
-    while idx < len(s):
-        if s[idx] == '\n':
-            line_starts.append(idx + 1)
-        idx += 1
+    line_starts.extend(idx + 1 for idx in range(len(s)) if s[idx] == '\n')
 
 
 # convert (line, col) to offset index
@@ -168,11 +155,7 @@ def find_start(node, s):
 
     elif isinstance(node, BinOp):
         leftstart = find_start(node.left, s)
-        if leftstart != None:
-            ret = leftstart
-        else:
-            ret = map_idx(node.lineno, node.col_offset)
-
+        ret = leftstart if leftstart != None else map_idx(node.lineno, node.col_offset)
     elif hasattr(node, 'lineno'):
         if node.col_offset >= 0:
             ret = map_idx(node.lineno, node.col_offset)
@@ -184,7 +167,7 @@ def find_start(node, s):
     else:
         return None
 
-    if ret == None and hasattr(node, 'lineno'):
+    if ret is None and hasattr(node, 'lineno'):
         raise TypeError("got None for node that has lineno", node)
 
     if isinstance(node, AST) and ret != None:
@@ -212,7 +195,7 @@ def find_end(node, s):
 
     elif isinstance(node, Str):
         i = find_start(node, s)
-        while s[i] != '"' and s[i] != "'":
+        while s[i] not in ['"', "'"]:
             i += 1
 
         if i + 2 < len(s) and s[i:i + 3] == '"""':
@@ -249,7 +232,6 @@ def find_end(node, s):
     elif isinstance(node, ClassDef):
         the_end = find_end(node.body, s)
 
-    # print will be a Call in Python 3
     elif not is_python3 and isinstance(node, Print):
         the_end = start_seq(s, '\n', find_start(node, s))
 
@@ -262,21 +244,18 @@ def find_end(node, s):
         the_end = find_end(node.value, s)
 
     elif isinstance(node, Return):
-        if node.value != None:
-            the_end = find_end(node.value, s)
-        else:
+        if node.value is None:
             the_end = find_start(node, s) + len('return')
 
-    elif (isinstance(node, For) or
-              isinstance(node, While) or
-              isinstance(node, If) or
-              isinstance(node, IfExp)):
+        else:
+            the_end = find_end(node.value, s)
+    elif isinstance(node, (For, While, If, IfExp)):
         if node.orelse != []:
             the_end = find_end(node.orelse, s)
         else:
             the_end = find_end(node.body, s)
 
-    elif isinstance(node, Assign) or isinstance(node, AugAssign):
+    elif isinstance(node, (Assign, AugAssign)):
         the_end = find_end(node.value, s)
 
     elif isinstance(node, BinOp):
@@ -375,28 +354,30 @@ def add_missing_names(node, s):
         # node.keyword_node = str_to_name(s, keyword_start)
         # node._fields += ('keyword_node',)
 
-        if node.args.vararg != None:
-            if len(node.args.args) > 0:
-                vstart = find_end(node.args.args[-1], s)
-            else:
-                vstart = find_end(node.name_node, s)
+        if node.args.vararg is None:
+            node.vararg_name = None
+        else:
+            vstart = (
+                find_end(node.args.args[-1], s)
+                if len(node.args.args) > 0
+                else find_end(node.name_node, s)
+            )
             if vstart != None:
                 vname = str_to_name(s, vstart)
                 node.vararg_name = vname
-        else:
-            node.vararg_name = None
         node._fields += ('vararg_name',)
 
-        if node.args.kwarg != None:
-            if len(node.args.args) > 0:
-                kstart = find_end(node.args.args[-1], s)
-            else:
-                kstart = find_end(node.vararg_name, s)
+        if node.args.kwarg is None:
+            node.kwarg_name = None
+        else:
+            kstart = (
+                find_end(node.args.args[-1], s)
+                if len(node.args.args) > 0
+                else find_end(node.vararg_name, s)
+            )
             if kstart:
                 kname = str_to_name(s, kstart)
                 node.kwarg_name = kname
-        else:
-            node.kwarg_name = None
         node._fields += ('kwarg_name',)
 
     elif isinstance(node, Attribute):
@@ -412,18 +393,12 @@ def add_missing_names(node, s):
             node.opsName = convert_ops(node.ops, s, start)
             node._fields += ('opsName',)
 
-    elif (isinstance(node, BoolOp) or
-              isinstance(node, BinOp) or
-              isinstance(node, UnaryOp) or
-              isinstance(node, AugAssign)):
+    elif isinstance(node, (BoolOp, BinOp, UnaryOp, AugAssign)):
         if hasattr(node, 'left'):
             start = find_end(node.left, s)
         else:
             start = find_start(node, s)
-        if start is not None:
-            ops = convert_ops([node.op], s, start)
-        else:
-            ops = []
+        ops = convert_ops([node.op], s, start) if start is not None else []
         if ops != []:
             node.op_node = ops[0]
             node._fields += ('op_node',)
@@ -498,15 +473,14 @@ def str_to_name(s, start):
         i += 1
     name_end = i
 
-    id1 = ''.join(ret)
-    if id1 == '':
-        return None
-    else:
+    if id1 := ''.join(ret):
         name = Name(id1, None)
         name.start = name_start
         name.end = name_end
         name.lineno, name.col_offset = map_line_col(name_start)
         return name
+    else:
+        return None
 
 
 def convert_ops(ops, s, start):
@@ -515,12 +489,13 @@ def convert_ops(ops, s, start):
         if type(op) in ops_map:
             syms.append(ops_map[type(op)])
         else:
-            print("[WARNING] operator %s is missing from ops_map, "
-                  "please report the bug on GitHub" % op)
+            print(
+                f"[WARNING] operator {op} is missing from ops_map, please report the bug on GitHub"
+            )
 
     i = start
-    j = 0
     ret = []
+    j = 0
     while i < len(s) and j < len(syms):
         oplen = len(syms[j])
         if s[i:i + oplen] == syms[j]:
@@ -581,19 +556,16 @@ ops_map = {
 
 # get list of fields from a node
 def node_fields(node):
-    ret = []
-    for field in node._fields:
-        if field != 'ctx' and hasattr(node, field):
-            ret.append(getattr(node, field))
-    return ret
+    return [
+        getattr(node, field)
+        for field in node._fields
+        if field != 'ctx' and hasattr(node, field)
+    ]
 
 
 # get full source text where the node is from
 def node_source(node):
-    if hasattr(node, 'node_source'):
-        return node.node_source
-    else:
-        return None
+    return node.node_source if hasattr(node, 'node_source') else None
 
 
 # utility for getting exact source code part of the node
@@ -602,17 +574,11 @@ def src(node):
 
 
 def start(node):
-    if hasattr(node, 'start'):
-        return node.start
-    else:
-        return 0
+    return node.start if hasattr(node, 'start') else 0
 
 
 def end(node):
-    if hasattr(node, 'end'):
-        return node.end
-    else:
-        return None
+    return node.end if hasattr(node, 'end') else None
 
 
 def is_alpha(c):
